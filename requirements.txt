@@ -3,3 +3,6 @@ pandas
 lxml
 html5lib
 beautifulsoup4
+supabase
+python-dotenv
+openpyxl
