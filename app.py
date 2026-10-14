@@ -1069,7 +1069,7 @@ def get_labor_database():
     employee_response = (
         supabase
         .table("labor_employees")
-        .select("id, employee_name, active, compensation_type")
+        .select("id, employee_name, active, compensation_type, date_of_birth, regular_hours")
         .execute()
     )
 
@@ -1300,6 +1300,114 @@ def get_current_employee_salary(employee_id):
 
 
 # ============================================================
+# EMPLOYEE AGE / BIRTHDAY HELPERS
+# ============================================================
+
+def age_on_date(date_of_birth, target_date):
+    """Return the employee's age on a specific schedule date."""
+    if not date_of_birth:
+        return None
+
+    dob = parse_date_value(date_of_birth)
+    target = parse_date_value(target_date)
+
+    return (
+        target.year
+        - dob.year
+        - ((target.month, target.day) < (dob.month, dob.day))
+    )
+
+
+def update_employee_birthdate(employee_id, date_of_birth):
+    """Save or correct an employee's date of birth."""
+    if date_of_birth is None:
+        raise ValueError("Date of birth is required.")
+
+    (
+        supabase
+        .table("labor_employees")
+        .update({"date_of_birth": parse_date_value(date_of_birth).isoformat()})
+        .eq("id", int(employee_id))
+        .execute()
+    )
+
+    clear_labor_cache()
+
+
+# ============================================================
+# REGULAR WEEKLY HOURS
+# ============================================================
+
+def update_employee_regular_hours(employee_id, regular_hours):
+    """Update the weekly scheduled-hours baseline used for 15% checks."""
+    hours = float(regular_hours)
+    if hours <= 0:
+        raise ValueError("Regular weekly hours must be greater than zero.")
+    supabase.table("labor_employees").update(
+        {"regular_hours": hours}
+    ).eq("id", int(employee_id)).execute()
+    clear_labor_cache()
+
+
+def build_regular_hours_checks(schedule_df, employees_db, aliases_db):
+    """Flag weekly scheduled paid hours >=15% above/below a saved baseline."""
+    if schedule_df.empty:
+        return pd.DataFrame()
+
+    working = schedule_df.copy()
+    if "shift_released" in working.columns:
+        working = working[working["shift_released"] != True].copy()
+    if working.empty:
+        return pd.DataFrame()
+
+    # Resolve aliases so all shifts for the same person count together.
+    working["_employee_id"] = working["employee"].apply(
+        lambda name: (
+            (lambda employee: f"id:{employee['id']}" if employee else f"name:{normalize_name(name)}")(
+                find_employee_by_name(name, employees_db, aliases_db)
+            )
+        )
+    )
+    records = []
+    week_start = min(parse_date_value(d) for d in working["date"])
+    week_start -= timedelta(days=week_start.weekday())
+    week_end = week_start + timedelta(days=6)
+
+    for _, shifts in working.groupby("_employee_id"):
+        employee = find_employee_by_name(shifts.iloc[0]["employee"], employees_db, aliases_db)
+        if employee is None or employee.get("regular_hours") is None:
+            continue
+        baseline = float(employee["regular_hours"])
+        if baseline <= 0:
+            continue
+        # Calculate scheduled paid hours after projected meal periods, using
+        # the existing interval-merging logic to avoid duplicate shift counting.
+        scheduled = 0.0
+        for _, day_shifts in shifts.groupby("date"):
+            scheduled += float(calculate_employee_day_summary(day_shifts)["post_break_hours"])
+        change_pct = (scheduled - baseline) / baseline * 100
+        if abs(change_pct) + 1e-8 < 15:
+            continue
+        direction = "Increase" if change_pct > 0 else "Decrease"
+        records.append({
+            "date": week_start,
+            "employee": employee["employee_name"],
+            "type": "Regular Hours 15% " + direction,
+            "severity": "Red Flag",
+            "details": (
+                f"Regular weekly hours: {baseline:.2f}; scheduled paid hours: "
+                f"{scheduled:.2f}; change: {change_pct:+.1f}% "
+                f"({week_start:%m/%d}–{week_end:%m/%d})."
+            ),
+            "regular_hours": baseline,
+            "scheduled_hours": round(scheduled, 2),
+            "change_pct": round(change_pct, 1),
+            "direction": direction,
+        })
+    return pd.DataFrame(records)
+
+
+# ============================================================
 # ADD TEAM MEMBER
 # ============================================================
 
@@ -1307,7 +1415,9 @@ def add_team_member(
     employee_name,
     compensation_type,
     compensation_amount,
-    effective_date
+    effective_date,
+    date_of_birth,
+    regular_hours
 ):
 
     employee_name = employee_name.strip()
@@ -1321,6 +1431,16 @@ def add_team_member(
 
     if compensation_amount is None or float(compensation_amount) <= 0:
         raise ValueError("Compensation amount must be greater than $0.")
+
+    if date_of_birth is None:
+        raise ValueError("Date of birth is required.")
+    if regular_hours is None or float(regular_hours) <= 0:
+        raise ValueError("Regular weekly hours must be greater than zero.")
+
+    date_of_birth = parse_date_value(date_of_birth)
+
+    if date_of_birth > date.today():
+        raise ValueError("Date of birth cannot be in the future.")
 
     existing = (
         supabase
@@ -1340,7 +1460,9 @@ def add_team_member(
             {
                 "employee_name": employee_name,
                 "active": True,
-                "compensation_type": compensation_type
+                "compensation_type": compensation_type,
+                "date_of_birth": date_of_birth.isoformat(),
+                "regular_hours": float(regular_hours)
             }
         )
         .execute()
@@ -2059,6 +2181,62 @@ def clear_actual_labor_cache():
 
 
 # ============================================================
+# MONTHLY VACATION PAY (SEPARATE FROM WEEKLY PAYROLL REPORTS)
+# ============================================================
+
+@st.cache_data(ttl=60)
+def get_vacation_pay_entries():
+    response = (
+        supabase.table("labor_vacation_pay")
+        .select("id, employee_name, pay_month, amount, created_at")
+        .order("pay_month", desc=True)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return response.data or []
+
+
+def save_vacation_pay(employee_name, pay_month, amount):
+    employee_name = clean_text(employee_name)
+    if not employee_name:
+        raise ValueError("Choose a team member.")
+    if float(amount) <= 0:
+        raise ValueError("Vacation pay must be greater than $0.")
+    month_start = date(pay_month.year, pay_month.month, 1)
+    response = (
+        supabase.table("labor_vacation_pay")
+        .insert({
+            "employee_name": employee_name,
+            "pay_month": month_start.isoformat(),
+            "amount": round(float(amount), 2),
+        })
+        .execute()
+    )
+    if not response.data:
+        raise RuntimeError("Vacation pay could not be saved.")
+    get_vacation_pay_entries.clear()
+
+
+def delete_vacation_pay(entry_id):
+    (
+        supabase.table("labor_vacation_pay")
+        .delete()
+        .eq("id", int(entry_id))
+        .execute()
+    )
+    get_vacation_pay_entries.clear()
+
+
+def vacation_total_for_month(entries, year, month):
+    return round(sum(
+        float(entry.get("amount") or 0)
+        for entry in entries
+        if parse_date_value(entry["pay_month"]).year == year
+        and parse_date_value(entry["pay_month"]).month == month
+    ), 2)
+
+
+# ============================================================
 # SAVED LABOR PROJECTIONS
 # ============================================================
 
@@ -2660,11 +2838,147 @@ def format_signed_pct(value):
 
 
 # ============================================================
+# CLOPEN / REST BETWEEN SHIFTS
+# ============================================================
+
+def build_clopen_checks(schedule_df, employees_db, aliases_db):
+    """Compare each employee's workday end with their next workday start."""
+    if schedule_df.empty:
+        return pd.DataFrame()
+
+    shifts = schedule_df.copy()
+    if "shift_released" in shifts.columns:
+        shifts = shifts[shifts["shift_released"] != True].copy()
+
+    by_employee_day = {}
+    for _, row in shifts.iterrows():
+        if pd.isna(row["start_time"]) or pd.isna(row["end_time"]):
+            continue
+        employee = find_employee_by_name(row["employee"], employees_db, aliases_db)
+        employee_key = (
+            f"id:{employee['id']}" if employee is not None
+            else f"name:{normalize_name(row['employee'])}"
+        )
+        employee_name = employee["employee_name"] if employee else row["employee"]
+        work_date = parse_date_value(row["date"])
+        start = datetime.combine(work_date, row["start_time"])
+        end = datetime.combine(work_date, row["end_time"])
+        if end <= start:
+            end += timedelta(days=1)
+        key = (employee_key, work_date)
+        day = by_employee_day.setdefault(key, {
+            "employee": employee_name, "date": work_date,
+            "first_start": start, "last_end": end
+        })
+        day["first_start"] = min(day["first_start"], start)
+        day["last_end"] = max(day["last_end"], end)
+
+    grouped = {}
+    for (employee_key, _), day in by_employee_day.items():
+        grouped.setdefault(employee_key, []).append(day)
+
+    issues = []
+    for days in grouped.values():
+        days.sort(key=lambda x: x["first_start"])
+        for previous, upcoming in zip(days, days[1:]):
+            gap = upcoming["first_start"] - previous["last_end"]
+            gap_minutes = round(gap.total_seconds() / 60)
+            if gap_minutes > 675:
+                continue
+            severity = "Red Flag" if gap_minutes <= 660 else "Warning"
+            if gap_minutes < 0:
+                rest_text = "Overlapping scheduled shifts"
+            else:
+                rest_text = f"{gap_minutes // 60}h {gap_minutes % 60:02d}m"
+            issues.append({
+                "date": upcoming["date"],
+                "employee": upcoming["employee"],
+                "type": "Clopen / Short Rest",
+                "severity": severity,
+                "details": (
+                    f"Previous shift ends {previous['last_end']:%a %m/%d %I:%M %p}; "
+                    f"next shift begins {upcoming['first_start']:%a %m/%d %I:%M %p}. "
+                    f"Rest: {rest_text}."
+                ),
+                "rest_minutes": gap_minutes,
+                "previous_end": previous["last_end"],
+                "next_start": upcoming["first_start"]
+            })
+    return pd.DataFrame(issues)
+
+
+# ============================================================
+# SPREAD OF HOURS — PREVENTIVE 10-HOUR RED FLAG
+# ============================================================
+
+def build_spread_of_hours_checks(schedule_df, employees_db, aliases_db):
+    """Flag a workday spanning >= 600 minutes, including breaks and gaps."""
+    if schedule_df.empty:
+        return pd.DataFrame()
+
+    shifts = schedule_df.copy()
+    if "shift_released" in shifts.columns:
+        shifts = shifts[shifts["shift_released"] != True].copy()
+
+    days = {}
+    for _, row in shifts.iterrows():
+        if pd.isna(row["start_time"]) or pd.isna(row["end_time"]):
+            continue
+        employee = find_employee_by_name(row["employee"], employees_db, aliases_db)
+        employee_key = (
+            f"id:{employee['id']}" if employee is not None
+            else f"name:{normalize_name(row['employee'])}"
+        )
+        employee_name = employee["employee_name"] if employee else row["employee"]
+        work_date = parse_date_value(row["date"])
+        start = datetime.combine(work_date, row["start_time"])
+        end = datetime.combine(work_date, row["end_time"])
+        if end <= start:
+            end += timedelta(days=1)
+        key = (employee_key, work_date)
+        day = days.setdefault(key, {
+            "date": work_date, "employee": employee_name,
+            "first_start": start, "last_end": end
+        })
+        day["first_start"] = min(day["first_start"], start)
+        day["last_end"] = max(day["last_end"], end)
+
+    issues = []
+    for day in days.values():
+        spread_minutes = round(
+            (day["last_end"] - day["first_start"]).total_seconds() / 60
+        )
+        if spread_minutes < 600:
+            continue
+        spread_text = f"{spread_minutes // 60}h {spread_minutes % 60:02d}m"
+        at_threshold = spread_minutes == 600
+        issues.append({
+            "date": day["date"],
+            "employee": day["employee"],
+            "type": "Spread of Hours",
+            "severity": "Red Flag",
+            "details": (
+                f"First shift starts {day['first_start']:%I:%M %p}; "
+                f"last shift ends {day['last_end']:%I:%M %p}. "
+                f"Total spread: {spread_text} (includes breaks and gaps). "
+                + ("Exactly 10 hours: even one minute late could trigger the premium."
+                   if at_threshold else "Over 10 hours: review potential spread-of-hours premium.")
+            ),
+            "first_start": day["first_start"],
+            "last_end": day["last_end"],
+            "spread_minutes": spread_minutes
+        })
+    return pd.DataFrame(issues)
+
+
+# ============================================================
 # SCHEDULE CHECKS
 # ============================================================
 
 def run_schedule_checks(
-    schedule_df
+    schedule_df,
+    employees_db,
+    aliases_db
 ):
 
     issues = []
@@ -2678,6 +2992,45 @@ def run_schedule_checks(
     for _, row in (
         employee_hours.iterrows()
     ):
+
+        schedule_date = parse_date_value(row["date"])
+        employee_data = find_employee_by_name(
+            row["employee"],
+            employees_db,
+            aliases_db
+        )
+
+        if employee_data is not None and employee_data.get("date_of_birth"):
+            employee_age = age_on_date(
+                employee_data["date_of_birth"],
+                schedule_date
+            )
+
+            # Internal Chick-fil-A scheduling rule:
+            # Team members under 18 should not be scheduled for more than
+            # 3.75 hours Monday through Thursday.
+            if (
+                employee_age is not None
+                and employee_age < 18
+                and schedule_date.weekday() in (0, 1, 2, 3)
+                and float(row["pre_break_hours"]) > 3.75
+            ):
+                over_by = float(row["pre_break_hours"]) - 3.75
+
+                issues.append(
+                    {
+                        "date": schedule_date,
+                        "employee": row["employee"],
+                        "type": "Internal Minor Hours",
+                        "severity": "Warning",
+                        "details": (
+                            f"Age {employee_age} on this shift date. "
+                            f"Scheduled {row['pre_break_hours']:.2f} hours "
+                            f"Monday-Thursday; internal limit is 3.75 hours "
+                            f"({over_by:.2f} hours over)."
+                        )
+                    }
+                )
 
         if (
             row[
@@ -2825,12 +3178,13 @@ with tab5:
         st.exception(supabase_error)
 
     else:
-        add_tab, pay_tab, salary_tab, alias_tab, team_tab = st.tabs(
+        add_tab, pay_tab, salary_tab, alias_tab, regular_tab, team_tab = st.tabs(
             [
                 "➕ Add Team Member",
                 "💵 Hourly Pay Changes",
                 "💼 Salary Management",
                 "🏷️ Employee Aliases",
+                "🕒 Regular Hours",
                 "👥 View Team"
             ]
         )
@@ -2876,6 +3230,26 @@ with tab5:
                     value=date.today()
                 )
 
+                new_date_of_birth = st.date_input(
+                    "Date of Birth",
+                    value=date(2000, 1, 1),
+                    max_value=date.today(),
+                    key="new_employee_date_of_birth",
+                    help=(
+                        "Used to automatically determine whether the team "
+                        "member is under 18 on each scheduled shift date."
+                    )
+                )
+
+                new_regular_hours = st.number_input(
+                    "Regular Weekly Hours",
+                    min_value=0.0,
+                    max_value=168.0,
+                    value=30.0,
+                    step=0.25,
+                    help="The employee's usual paid hours per week, used as the 15% schedule-change baseline."
+                )
+
                 add_button = st.form_submit_button(
                     "Add Team Member",
                     type="primary"
@@ -2887,7 +3261,9 @@ with tab5:
                         new_name,
                         compensation_type_label.lower(),
                         compensation_amount,
-                        new_effective_date
+                        new_effective_date,
+                        new_date_of_birth,
+                        new_regular_hours
                     )
                     st.success(f"{new_name.strip()} was added successfully.")
                     employees_db, rates_db, salaries_db, aliases_db = (
@@ -3190,6 +3566,45 @@ with tab5:
                         except Exception as e:
                             st.error(f"Alias was NOT deleted: {e}")
 
+        with regular_tab:
+            st.subheader("Edit Regular Weekly Hours")
+            st.caption(
+                "These are each employee's usual PAID hours per week. "
+                "The Schedule Checks tab flags scheduled hours 15% or more above or below this baseline."
+            )
+            if not employees_db:
+                st.info("Add a team member first.")
+            else:
+                regular_options = {
+                    emp["employee_name"]: emp for emp in employees_db
+                }
+                regular_name = st.selectbox(
+                    "Team Member", sorted(regular_options), key="regular_hours_employee"
+                )
+                regular_employee = regular_options[regular_name]
+                current_regular = regular_employee.get("regular_hours")
+                if current_regular is None:
+                    st.warning("No regular weekly hours saved for this employee yet.")
+                else:
+                    st.metric("Current Regular Weekly Hours", f"{float(current_regular):.2f}")
+                with st.form("edit_regular_hours_form"):
+                    new_regular_value = st.number_input(
+                        "New Regular Weekly Hours",
+                        min_value=0.25,
+                        max_value=168.0,
+                        value=float(current_regular) if current_regular and float(current_regular) > 0 else 30.0,
+                        step=0.25,
+                        key=f"regular_hours_edit_{regular_employee['id']}"
+                    )
+                    save_regular = st.form_submit_button("Save Regular Hours", type="primary")
+                if save_regular:
+                    try:
+                        update_employee_regular_hours(regular_employee["id"], new_regular_value)
+                        employees_db, rates_db, salaries_db, aliases_db = get_labor_database()
+                        st.success(f"Updated {regular_name} to {new_regular_value:.2f} regular weekly hours.")
+                    except Exception as exc:
+                        st.error(f"Could not update regular hours: {exc}")
+
         with team_tab:
             st.subheader("Team Members")
 
@@ -3221,6 +3636,16 @@ with tab5:
                             "Team Member": employee["employee_name"],
                             "Type": compensation_type.title(),
                             "Current Compensation": compensation_display,
+                            "Birthday": (
+                                parse_date_value(employee["date_of_birth"]).strftime("%m/%d/%Y")
+                                if employee.get("date_of_birth")
+                                else "Not Entered"
+                            ),
+                            "Age Today": (
+                                age_on_date(employee["date_of_birth"], date.today())
+                                if employee.get("date_of_birth")
+                                else "—"
+                            ),
                             "Status": "Active" if employee["active"] else "Inactive"
                         }
                     )
@@ -3230,6 +3655,68 @@ with tab5:
                     use_container_width=True,
                     hide_index=True
                 )
+
+                st.divider()
+                st.subheader("Birthday / Minor Status")
+                st.caption(
+                    "The app calculates age on the date of each shift. "
+                    "Once a team member turns 18, minor warnings stop automatically "
+                    "for shifts on or after their 18th birthday."
+                )
+
+                birthday_name = st.selectbox(
+                    "Select Team Member",
+                    [employee["employee_name"] for employee in employees_db],
+                    key="birthday_employee"
+                )
+
+                birthday_employee = next(
+                    employee
+                    for employee in employees_db
+                    if employee["employee_name"] == birthday_name
+                )
+
+                existing_dob = birthday_employee.get("date_of_birth")
+
+                birthday_value = (
+                    parse_date_value(existing_dob)
+                    if existing_dob
+                    else date(2000, 1, 1)
+                )
+
+                with st.form("employee_birthday_form"):
+                    edited_birthdate = st.date_input(
+                        "Date of Birth",
+                        value=birthday_value,
+                        max_value=date.today(),
+                        key="edit_employee_date_of_birth"
+                    )
+
+                    save_birthday = st.form_submit_button(
+                        "Save Birthday",
+                        type="primary"
+                    )
+
+                if existing_dob:
+                    current_age = age_on_date(existing_dob, date.today())
+                    st.write(
+                        f"Current age: **{current_age}**"
+                        + (" — Minor" if current_age < 18 else " — 18 or older")
+                    )
+
+                if save_birthday:
+                    try:
+                        update_employee_birthdate(
+                            birthday_employee["id"],
+                            edited_birthdate
+                        )
+                        st.success(
+                            f"Birthday saved for {birthday_name}: "
+                            f"{edited_birthdate.strftime('%m/%d/%Y')}."
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Birthday was NOT saved: {e}")
 
                 st.divider()
                 st.subheader("Employee Status")
@@ -3370,7 +3857,16 @@ with tab7:
                     ]
 
                     monthly_sales = sum(float(row.get("projected_sales") or 0) for row in month_days)
-                    monthly_labor = sum(float(row.get("projected_labor_cost") or 0) for row in month_days)
+                    monthly_base_labor = sum(float(row.get("projected_labor_cost") or 0) for row in month_days)
+                    try:
+                        projection_vacation_entries = get_vacation_pay_entries()
+                        monthly_vacation_pay = vacation_total_for_month(
+                            projection_vacation_entries, selected_year, selected_month
+                        )
+                    except Exception as e:
+                        monthly_vacation_pay = 0.0
+                        st.warning(f"Could not load monthly vacation pay: {e}")
+                    monthly_labor = monthly_base_labor + monthly_vacation_pay
                     monthly_labor_pct = (monthly_labor / monthly_sales * 100) if monthly_sales > 0 else None
                     saved_day_count = len({row["schedule_date"] for row in month_days})
                     projection_week_ids = {row["projection_week_id"] for row in month_days}
@@ -3383,6 +3879,10 @@ with tab7:
                         f"{monthly_labor_pct:.2f}%" if monthly_labor_pct is not None else "—"
                     )
                     m4.metric("Saved Projection Days", str(saved_day_count))
+                    pv1, pv2 = st.columns(2)
+                    pv1.metric("Scheduled Labor (Month)", f"${monthly_base_labor:,.2f}")
+                    pv2.metric("Vacation Pay (Month)", f"${monthly_vacation_pay:,.2f}")
+                    st.caption("Vacation pay is assigned to the calendar month only; it does not change saved weekly projections.")
                     st.caption(
                         f"Calculated from {saved_day_count} saved day(s) across "
                         f"{len(projection_week_ids)} saved week(s) in {selected_month_label}. "
@@ -3914,6 +4414,131 @@ with tab8:
 
 
     st.divider()
+    st.subheader("🏖️ Vacation Pay")
+    st.caption(
+        "Record vacation pay for a calendar month. These amounts are saved "
+        "separately from payroll reports and included in both monthly projected "
+        "and monthly actual labor totals. No schedule or payroll upload is required."
+    )
+
+    try:
+        vacation_entries = get_vacation_pay_entries()
+        vacation_data_ready = True
+    except Exception as vacation_error:
+        vacation_entries = []
+        vacation_data_ready = False
+        st.error(
+            "Vacation pay storage is not ready. Run the supplied "
+            "labor_vacation_pay SQL in Supabase first."
+        )
+        st.caption(str(vacation_error))
+
+    if vacation_data_ready:
+        employee_names_for_vacation = sorted({
+            clean_text(employee.get("employee_name"))
+            for employee in employees_db
+            if clean_text(employee.get("employee_name"))
+        }) if not supabase_error else []
+
+        available_vacation_months = sorted({
+            date.today().replace(day=1),
+            *[parse_date_value(entry["pay_month"]).replace(day=1)
+              for entry in vacation_entries]
+        }, reverse=True)
+        st.caption("Choose any month, then add or remove vacation pay for that month.")
+        selected_vacation_month = st.date_input(
+            "Vacation Pay Month (select any date in the month)",
+            value=date.today().replace(day=1),
+            key="vacation_month_selector"
+        )
+        selected_vacation_month = selected_vacation_month.replace(day=1)
+        st.metric(
+            f"Vacation Pay — {selected_vacation_month:%B %Y}",
+            f"${vacation_total_for_month(vacation_entries, selected_vacation_month.year, selected_vacation_month.month):,.2f}"
+        )
+
+        with st.form("vacation_pay_entry_form", clear_on_submit=True):
+            vp1, vp3 = st.columns([2, 1.4])
+            with vp1:
+                vacation_employee = st.selectbox(
+                    "Team Member",
+                    options=employee_names_for_vacation,
+                    key="vacation_pay_employee",
+                    placeholder="Select team member"
+                )
+            with vp3:
+                vacation_amount = st.number_input(
+                    "Vacation Pay ($)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=25.0,
+                    format="%.2f",
+                    key="vacation_pay_amount"
+                )
+            save_vacation_clicked = st.form_submit_button(
+                "💾 Save Vacation Pay", type="primary"
+            )
+
+        if save_vacation_clicked:
+            try:
+                save_vacation_pay(
+                    vacation_employee, selected_vacation_month, vacation_amount
+                )
+                st.success("Vacation pay saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Vacation pay was not saved: {e}")
+
+        visible_vacation_entries = [
+            entry for entry in vacation_entries
+            if parse_date_value(entry["pay_month"]).year == selected_vacation_month.year
+            and parse_date_value(entry["pay_month"]).month == selected_vacation_month.month
+        ]
+        if visible_vacation_entries:
+            st.markdown(f"**Saved vacation pay — {selected_vacation_month:%B %Y}**")
+            st.dataframe(
+                pd.DataFrame([{
+                    "Employee": entry["employee_name"],
+                    "Month": parse_date_value(entry["pay_month"]).strftime("%B %Y"),
+                    "Vacation Pay": f"${float(entry['amount']):,.2f}",
+                    "Entry ID": entry["id"]
+                } for entry in visible_vacation_entries]),
+                use_container_width=True,
+                hide_index=True
+            )
+            st.metric(
+                "Vacation Pay in View",
+                f"${sum(float(e['amount']) for e in visible_vacation_entries):,.2f}"
+            )
+            entry_choices = {
+                f"#{entry['id']} — {entry['employee_name']} — "
+                f"{parse_date_value(entry['pay_month']).strftime('%B %Y')} — "
+                f"${float(entry['amount']):,.2f}": int(entry["id"])
+                for entry in visible_vacation_entries
+            }
+            with st.form("delete_vacation_pay_form"):
+                delete_choice = st.selectbox(
+                    "Select Vacation Pay Entry to Delete",
+                    list(entry_choices),
+                    key="vacation_pay_delete_choice"
+                )
+                confirm_vacation_delete = st.checkbox(
+                    "I confirm I want to permanently delete this vacation pay entry."
+                )
+                delete_clicked = st.form_submit_button(
+                    "🗑️ Delete Selected Vacation Pay",
+                    disabled=not confirm_vacation_delete
+                )
+            if delete_clicked and confirm_vacation_delete:
+                try:
+                    delete_vacation_pay(entry_choices[delete_choice])
+                    st.success("Vacation pay entry deleted.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not delete vacation pay: {e}")
+        else:
+            st.info("No vacation pay entries for this month.")
+
     st.divider()
     st.subheader("📚 Actual Labor History")
     st.caption(
@@ -4104,9 +4729,13 @@ with tab8:
         monthly_actual_sales = float(
             month_actual_df["actual_sales"].astype(float).sum()
         )
-        monthly_actual_labor = float(
+        monthly_payroll_labor = float(
             month_actual_df["actual_labor_cost"].astype(float).sum()
         )
+        monthly_vacation_labor = vacation_total_for_month(
+            vacation_entries, actual_year, actual_month
+        )
+        monthly_actual_labor = monthly_payroll_labor + monthly_vacation_labor
         monthly_actual_pct = (
             monthly_actual_labor / monthly_actual_sales * 100
             if monthly_actual_sales > 0
@@ -4139,9 +4768,12 @@ with tab8:
         )
 
         st.caption(
-            "Monthly labor % is total saved actual labor divided by "
-            "total saved actual sales for that calendar month."
+            "Monthly labor % includes saved payroll labor plus vacation pay, "
+            "divided by saved actual sales for the selected calendar month."
         )
+        vm1, vm2 = st.columns(2)
+        vm1.metric("Payroll Labor (Month)", f"${monthly_payroll_labor:,.2f}")
+        vm2.metric("Vacation Pay (Month)", f"${monthly_vacation_labor:,.2f}")
 
 
 
@@ -5892,16 +6524,105 @@ with tab6:
     )
 
     st.info(
-        "This currently contains basic schedule-quality "
-        "checks. Additional Fair Workweek, minor, meeting, "
-        "availability, and internal rules can be added later."
+        "Includes schedule-quality checks and the internal minor rule: "
+        "team members under 18 scheduled Monday-Thursday for more than "
+        "3.75 hours are flagged automatically using their birthday."
     )
 
-    issues_df = (
-        run_schedule_checks(
-            schedule_df
-        )
+    st.caption(
+        "Clopen checks: red flag at 11h or less; warning above 11h "
+        "through 11h 15m. The warning is attached to the next shift date."
     )
+    # Clopen checks use only the single uploaded weekly schedule.
+    clopen_schedule_df = schedule_df
+
+    issues_df = run_schedule_checks(schedule_df, employees_db, aliases_db)
+    regular_df = build_regular_hours_checks(schedule_df, employees_db, aliases_db)
+    st.subheader("🚩 Regular Weekly Hours — 15% Change")
+    st.caption(
+        "Compares each employee's scheduled paid hours (after projected meal periods) "
+        "with their saved regular weekly hours. Both increases and decreases of "
+        "15% or more are red-flagged."
+    )
+    if regular_df.empty:
+        st.success("No 15% regular-hours changes detected for employees with a saved baseline.")
+    else:
+        st.error(f"Regular-hours red flags: {len(regular_df)}")
+        regular_display = regular_df[[
+            "employee", "regular_hours", "scheduled_hours", "change_pct", "direction"
+        ]].copy()
+        regular_display.columns = [
+            "Employee", "Regular Hours", "Scheduled Paid Hours", "Change %", "Change"
+        ]
+        st.dataframe(regular_display, use_container_width=True, hide_index=True)
+        issues_df = pd.concat([
+            issues_df,
+            regular_df[["date", "employee", "type", "severity", "details"]]
+        ], ignore_index=True)
+
+
+    clopen_df = build_clopen_checks(
+        clopen_schedule_df, employees_db, aliases_db
+    )
+    spread_df = build_spread_of_hours_checks(
+        schedule_df, employees_db, aliases_db
+    )
+    if not spread_df.empty:
+        issues_df = pd.concat(
+            [issues_df, spread_df[["date", "employee", "type", "severity", "details"]]],
+            ignore_index=True
+        )
+
+    st.subheader("🚩 Spread of Hours — 10 Hours or More")
+    st.caption(
+        "Preventive red flag at exactly 10 hours or more, measured from the "
+        "first scheduled start to the final scheduled end each day, including "
+        "breaks and gaps. The legal premium generally applies when spread exceeds 10 hours."
+    )
+    if spread_df.empty:
+        st.success("No 10-hour spread-of-hours red flags in the uploaded week.")
+    else:
+        st.error(f"Spread-of-hours red flags: {len(spread_df)}")
+        spread_display = spread_df[
+            ["employee", "date", "first_start", "last_end", "spread_minutes", "severity"]
+        ].copy()
+        spread_display["date"] = spread_display["date"].apply(
+            lambda d: parse_date_value(d).strftime("%a %m/%d")
+        )
+        for col in ("first_start", "last_end"):
+            spread_display[col] = spread_display[col].dt.strftime("%I:%M %p")
+        spread_display["spread_minutes"] = spread_display["spread_minutes"].apply(
+            lambda m: f"{m // 60}h {m % 60:02d}m"
+        )
+        spread_display.columns = [
+            "Employee", "Date", "First Start", "Last End", "Spread", "Severity"
+        ]
+        st.dataframe(spread_display, use_container_width=True, hide_index=True)
+
+    if not clopen_df.empty:
+        issues_df = pd.concat(
+            [issues_df, clopen_df[["date", "employee", "type", "severity", "details"]]],
+            ignore_index=True
+        )
+        st.subheader("🚩 Clopen Alerts (Uploaded Week)")
+        red_flags = int((clopen_df["severity"] == "Red Flag").sum())
+        warnings = int((clopen_df["severity"] == "Warning").sum())
+        st.error(f"Red Flags: {red_flags}") if red_flags else None
+        st.warning(f"Warnings: {warnings}") if warnings else None
+        display_clopens = clopen_df[
+            ["employee", "severity", "previous_end", "next_start", "rest_minutes"]
+        ].copy()
+        display_clopens["previous_end"] = display_clopens["previous_end"].dt.strftime("%a %m/%d %I:%M %p")
+        display_clopens["next_start"] = display_clopens["next_start"].dt.strftime("%a %m/%d %I:%M %p")
+        display_clopens["rest_minutes"] = display_clopens["rest_minutes"].apply(
+            lambda m: f"{m // 60}h {m % 60:02d}m" if m >= 0 else "Overlap"
+        )
+        display_clopens.columns = [
+            "Employee", "Severity", "Previous Shift End", "Next Shift Start", "Rest Period"
+        ]
+        st.dataframe(display_clopens, use_container_width=True, hide_index=True)
+    else:
+        st.success("No clopens detected in the uploaded weekly schedule.")
 
     if issues_df.empty:
 
